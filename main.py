@@ -16,6 +16,7 @@ import signal
 import sys
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -58,7 +59,7 @@ class Skill:
 
 # Keyword → Skill mapping (KWS detects these exact keywords)
 # Key sequence: element keys → V (invoke) → D (cast)
-SKILLS: Dict[str, Skill] = {
+DEFAULT_SKILLS: Dict[str, Skill] = {
     "天火": Skill("天火", "CCC"),   # Sun Strike:      CCC + V + D
     "陨石": Skill("陨石", "CCX"),   # Chaos Meteor:     CCX + V + D
     "吹风": Skill("吹风", "ZXX"),   # Tornado:          ZXX + V + D
@@ -67,6 +68,43 @@ SKILLS: Dict[str, Skill] = {
     "冰墙": Skill("冰墙", "ZZC"),   # Ice Wall:         ZZC + V + D
     "推波": Skill("推波", "ZXC"),   # Deafening Blast:  ZXC + V + D
 }
+
+
+def load_skills_from_yaml() -> Dict[str, Skill]:
+    """Load skills from skills.yaml. Falls back to DEFAULT_SKILLS on any error."""
+    yaml_path = Path(os.environ.get("DOTA_SKILLS_FILE", "skills.yaml"))
+    if not yaml_path.exists():
+        print(f"[CFG] skills file not found: {yaml_path}, using defaults")
+        return dict(DEFAULT_SKILLS)
+
+    try:
+        import yaml  # type: ignore
+    except Exception:
+        print("[CFG] PyYAML not installed, using default skills")
+        return dict(DEFAULT_SKILLS)
+
+    try:
+        data = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
+        skills_section = data.get("skills", {})
+        loaded: Dict[str, Skill] = {}
+
+        for keyword, conf in skills_section.items():
+            combo = str(conf.get("combo", "")).upper().strip()
+            if len(combo) != 3 or any(ch not in {"Z", "X", "C"} for ch in combo):
+                raise ValueError(f"Invalid combo for '{keyword}': {combo}")
+            loaded[str(keyword)] = Skill(name=str(keyword), keys=combo)
+
+        if not loaded:
+            raise ValueError("No skills loaded from YAML")
+
+        print(f"[CFG] loaded {len(loaded)} skills from {yaml_path}")
+        return loaded
+    except Exception as e:
+        print(f"[CFG] failed to parse {yaml_path}: {e}; using defaults")
+        return dict(DEFAULT_SKILLS)
+
+
+SKILLS: Dict[str, Skill] = load_skills_from_yaml()
 
 # QWER → ZXCV keybind mapping
 KEYMAP = {

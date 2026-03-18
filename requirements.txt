@@ -2,3 +2,4 @@ numpy
 sounddevice
 pynput
 sherpa-onnx
+PyYAML
