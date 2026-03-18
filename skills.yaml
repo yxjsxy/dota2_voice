@@ -1,6 +1,8 @@
 # Dota2 Invoker KWS skill mapping (QWER -> ZXCV)
 # Z=Quas(冰), X=Wex(电), C=Exort(火), V=Invoke(切), D=Cast
 
+cast_mode: normal
+
 skills:
   天火:
     combo: CCC

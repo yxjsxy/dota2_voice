@@ -29,6 +29,7 @@ except Exception as e:  # pragma: no cover
 
 try:
     from pynput.keyboard import Controller as KeyboardController
+    from pynput.mouse import Button, Controller as MouseController
 except Exception as e:  # pragma: no cover
     print(f"[FATAL] pynput not available: {e}")
     sys.exit(1)
@@ -70,18 +71,18 @@ DEFAULT_SKILLS: Dict[str, Skill] = {
 }
 
 
-def load_skills_from_yaml() -> Dict[str, Skill]:
-    """Load skills from skills.yaml. Falls back to DEFAULT_SKILLS on any error."""
+def load_config_from_yaml() -> tuple[Dict[str, Skill], str]:
+    """Load skills + cast_mode from skills.yaml. Falls back on any error."""
     yaml_path = Path(os.environ.get("DOTA_SKILLS_FILE", "skills.yaml"))
     if not yaml_path.exists():
         print(f"[CFG] skills file not found: {yaml_path}, using defaults")
-        return dict(DEFAULT_SKILLS)
+        return dict(DEFAULT_SKILLS), "quick"
 
     try:
         import yaml  # type: ignore
     except Exception:
         print("[CFG] PyYAML not installed, using default skills")
-        return dict(DEFAULT_SKILLS)
+        return dict(DEFAULT_SKILLS), "quick"
 
     try:
         data = yaml.safe_load(yaml_path.read_text(encoding="utf-8")) or {}
@@ -97,14 +98,18 @@ def load_skills_from_yaml() -> Dict[str, Skill]:
         if not loaded:
             raise ValueError("No skills loaded from YAML")
 
-        print(f"[CFG] loaded {len(loaded)} skills from {yaml_path}")
-        return loaded
+        cast_mode = str(data.get("cast_mode", "quick")).strip().lower()
+        if cast_mode not in {"quick", "normal"}:
+            cast_mode = "quick"
+
+        print(f"[CFG] loaded {len(loaded)} skills from {yaml_path}, cast_mode={cast_mode}")
+        return loaded, cast_mode
     except Exception as e:
         print(f"[CFG] failed to parse {yaml_path}: {e}; using defaults")
-        return dict(DEFAULT_SKILLS)
+        return dict(DEFAULT_SKILLS), "quick"
 
 
-SKILLS: Dict[str, Skill] = load_skills_from_yaml()
+SKILLS, CAST_MODE = load_config_from_yaml()
 
 # QWER → ZXCV keybind mapping
 KEYMAP = {
@@ -145,15 +150,17 @@ class Debouncer:
 
 # ──────────────────── Keyboard caster ───────────────────────
 class InvokerCaster:
-    def __init__(self, keyboard=None):
+    def __init__(self, keyboard=None, mouse=None, cast_mode: str = "quick"):
         self.kbd = keyboard or KeyboardController()
+        self.mouse = mouse or MouseController()
+        self.cast_mode = cast_mode if cast_mode in {"quick", "normal"} else "quick"
 
     def _tap(self, key: str):
         self.kbd.press(key)
         self.kbd.release(key)
 
     def cast_skill(self, skill: Skill) -> List[str]:
-        """Execute skill key sequence. Returns list of keys pressed."""
+        """Execute skill key sequence. Returns list of keys/actions."""
         keys_pressed = []
 
         # Element keys
@@ -169,10 +176,16 @@ class InvokerCaster:
         self._tap(KEYMAP["V"])
         keys_pressed.append(KEYMAP["V"])
 
-        # Cast
+        # Cast key
         time.sleep(random.uniform(CAST_DELAY_MIN, CAST_DELAY_MAX))
         self._tap(KEYMAP["D"])
         keys_pressed.append(KEYMAP["D"])
+
+        # Normal cast mode: auto left-click at current mouse position
+        if self.cast_mode == "normal":
+            time.sleep(0.03)
+            self.mouse.click(Button.left, 1)
+            keys_pressed.append("mouse_left")
 
         return keys_pressed
 
@@ -271,7 +284,7 @@ class KeywordSpotter:
 class VoiceInvoker:
     def __init__(self, kws: Optional[KeywordSpotter] = None, caster: Optional[InvokerCaster] = None):
         self.kws = kws  # lazily init in run() if None
-        self.caster = caster or InvokerCaster()
+        self.caster = caster or InvokerCaster(cast_mode=CAST_MODE)
         self.debouncer = Debouncer(DEBOUNCE_MS)
         self.audio_q: queue.Queue[np.ndarray] = queue.Queue(maxsize=512)
         self.running = True
@@ -310,7 +323,7 @@ class VoiceInvoker:
         print("=" * 64)
         print("Dota2 Invoker Voice — Pure KWS Mode")
         print(f"关键词: {', '.join(SKILLS.keys())}")
-        print(f"去抖动: {DEBOUNCE_MS}ms | 改键: QWER→ZXCV")
+        print(f"去抖动: {DEBOUNCE_MS}ms | 改键: QWER→ZXCV | cast_mode={self.caster.cast_mode}")
         print("按 Ctrl+C 退出")
         print("=" * 64)
 

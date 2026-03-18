@@ -5,6 +5,9 @@
 ## 功能
 - 纯 KWS 实时识别（sherpa-onnx）
 - 关键词 → Invoker 连招（改键 QWER → ZXCV）
+- 支持 `cast_mode`:
+  - `quick`: 只按技能键（D）
+  - `normal`: 按 D 后自动左键点击当前鼠标位置（普通施法自动落点）
 - 350ms 同关键词去抖动
 - `skills.yaml` 可配置关键词与元素组合
 

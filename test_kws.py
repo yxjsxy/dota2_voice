@@ -97,6 +97,19 @@ def test_caster_key_sequence():
     print("[PASS] test_caster_key_sequence")
 
 
+def test_caster_normal_mode_clicks_mouse():
+    """Normal mode should auto click mouse-left after cast key."""
+    mock_kbd = MagicMock()
+    mock_mouse = MagicMock()
+    caster = InvokerCaster(keyboard=mock_kbd, mouse=mock_mouse, cast_mode="normal")
+
+    skill = SKILLS["天火"]
+    keys = caster.cast_skill(skill)
+    assert keys[-1] == "mouse_left"
+    mock_mouse.click.assert_called_once()
+    print("[PASS] test_caster_normal_mode_clicks_mouse")
+
+
 def test_on_keyword_integration():
     """Test full _on_keyword path with mock caster."""
     mock_kbd = MagicMock()
@@ -171,6 +184,7 @@ if __name__ == "__main__":
         test_debouncer_allows_after_window,
         test_debouncer_independent_keywords,
         test_caster_key_sequence,
+        test_caster_normal_mode_clicks_mouse,
         test_on_keyword_integration,
         test_on_keyword_debounce,
         test_no_asr_imports,
