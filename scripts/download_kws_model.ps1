@@ -1,28 +1,37 @@
 Param(
-    [Parameter(Mandatory = $true)]
-    [string]$ModelZipUrl,
-
+    [string]$ModelUrl = "https://github.com/k2-fsa/sherpa-onnx/releases/download/kws-models/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2",
     [string]$OutDir = "kws_model"
 )
 
 $ErrorActionPreference = "Stop"
 
 Write-Host "[KWS] Downloading model..." -ForegroundColor Cyan
-Write-Host "URL: $ModelZipUrl"
+Write-Host "URL: $ModelUrl"
 
 $root = Split-Path -Parent $PSScriptRoot
 $targetDir = Join-Path $root $OutDir
 $tmpDir = Join-Path $env:TEMP ("dota2_kws_" + [Guid]::NewGuid().ToString("N"))
-$zipPath = Join-Path $tmpDir "model.zip"
+$archivePath = Join-Path $tmpDir (Split-Path $ModelUrl -Leaf)
 
 New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
 New-Item -ItemType Directory -Path $targetDir -Force | Out-Null
 
 try {
-    Invoke-WebRequest -Uri $ModelZipUrl -OutFile $zipPath
+    Invoke-WebRequest -Uri $ModelUrl -OutFile $archivePath
 
     Write-Host "[KWS] Extracting..." -ForegroundColor Cyan
-    Expand-Archive -Path $zipPath -DestinationPath $tmpDir -Force
+    if ($archivePath -match "\.zip$") {
+        Expand-Archive -Path $archivePath -DestinationPath $tmpDir -Force
+    }
+    elseif ($archivePath -match "\.tar\.bz2$" -or $archivePath -match "\.tbz2$") {
+        tar -xjf $archivePath -C $tmpDir
+    }
+    elseif ($archivePath -match "\.tar\.gz$" -or $archivePath -match "\.tgz$") {
+        tar -xzf $archivePath -C $tmpDir
+    }
+    else {
+        throw "Unsupported archive format: $archivePath"
+    }
 
     $encoder = Get-ChildItem -Path $tmpDir -Recurse -Filter "encoder*.onnx" | Select-Object -First 1
     $decoder = Get-ChildItem -Path $tmpDir -Recurse -Filter "decoder*.onnx" | Select-Object -First 1
@@ -36,7 +45,7 @@ try {
     Copy-Item $encoder.FullName (Join-Path $targetDir $encoder.Name) -Force
     Copy-Item $decoder.FullName (Join-Path $targetDir $decoder.Name) -Force
     Copy-Item $joiner.FullName  (Join-Path $targetDir $joiner.Name)  -Force
-    Copy-Item $tokens.FullName  (Join-Path $targetDir "tokens.txt")   -Force
+    Copy-Item $tokens.FullName  (Join-Path $targetDir "tokens.txt") -Force
 
     Write-Host "[KWS] Model ready at: $targetDir" -ForegroundColor Green
     Write-Host "[KWS] Files:"

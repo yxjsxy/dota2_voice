@@ -43,10 +43,18 @@ pip install -r requirements.txt
 
 ```powershell
 cd dota2_voice
-powershell -ExecutionPolicy Bypass -File .\scripts\download_kws_model.ps1 -ModelZipUrl "<你的 sherpa-onnx 中文KWS模型zip直链>"
+powershell -ExecutionPolicy Bypass -File .\scripts\download_kws_model.ps1
 ```
 
+默认会下载官方中英 KWS 模型：
+`sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20.tar.bz2`
+
 下载完成后会自动解压并拷贝到 `kws_model/`。
+
+如需自定义链接：
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\download_kws_model.ps1 -ModelUrl "<model-archive-url>"
+```
 
 > 也可手动放置模型，或用环境变量指定路径：
 > `DOTA_KWS_MODEL_DIR=你的模型目录`
