@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
 """
-Dota2 Invoker Voice Control
-- Realtime microphone listening with simple energy VAD
-- SenseVoice STT via http://localhost:8771/transcribe
-- Fuzzy matching Chinese skill names
-- pynput keyboard simulation for Invoker combos (Karl keybinds)
+Dota2 Invoker Voice Control — Pure KWS Architecture
+- Realtime microphone keyword spotting via sherpa-onnx (no ASR/STT fallback)
+- Chinese skill name detection → ZXCV key sequence simulation
+- 350ms per-keyword debounce
+- pynput keyboard simulation for Invoker combos
 """
 
 from __future__ import annotations
 
-import io
+import os
 import queue
 import random
 import signal
 import sys
-import threading
 import time
-import wave
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
-import requests
 
 try:
     import sounddevice as sd
@@ -35,32 +32,14 @@ except Exception as e:  # pragma: no cover
     print(f"[FATAL] pynput not available: {e}")
     sys.exit(1)
 
-try:
-    from rapidfuzz import fuzz
-    HAS_RAPIDFUZZ = True
-except Exception:
-    HAS_RAPIDFUZZ = False
 
-import difflib
-
-
-# ---------------- Config ----------------
+# ──────────────────── Config ────────────────────────────────
 SAMPLE_RATE = 16000
 CHANNELS = 1
-BLOCK_MS = 30
-BLOCK_SIZE = int(SAMPLE_RATE * BLOCK_MS / 1000)
+BLOCK_SIZE = 512  # ~32ms per block at 16kHz
 
-STT_URL = "http://localhost:8771/transcribe"
-STT_TIMEOUT = 15
-
-# VAD tuning (energy-based)
-NOISE_EMA_ALPHA = 0.92
-START_MULTIPLIER = 2.6
-END_MULTIPLIER = 1.7
-MIN_SPEECH_SEC = 0.28
-END_SILENCE_SEC = 0.55
-PRE_ROLL_SEC = 0.30
-MAX_UTTERANCE_SEC = 4.0
+# Debounce: same keyword suppressed within this window
+DEBOUNCE_MS = 350
 
 # Key timing
 ELEM_DELAY_MIN = 0.030
@@ -70,25 +49,26 @@ CAST_DELAY_MIN = 0.080
 CAST_DELAY_MAX = 0.100
 
 
+# ──────────────────── Skill definitions ─────────────────────
 @dataclass
 class Skill:
     name: str
-    keys: str
-    aliases: Tuple[str, ...]
+    keys: str  # element combo: Z=Quas, X=Wex, C=Exort
 
 
+# Keyword → Skill mapping (KWS detects these exact keywords)
+# Key sequence: element keys → V (invoke) → D (cast)
 SKILLS: Dict[str, Skill] = {
-    "天火": Skill("天火", "CCC", ("天火", "添火", "天活", "天货", "天祸", "日炎")),
-    "陨石": Skill("陨石", "CCX", ("陨石", "陨时", "陨实", "云石", "运势")),
-    "吹风": Skill("吹风", "ZXX", ("吹风", "吹封", "垂风", "飓风", "龙卷风")),
-    "磁暴": Skill("磁暴", "XXX", ("磁暴", "词包", "自爆", "磁爆", "电磁爆")),
-    "隐身": Skill("隐身", "ZZX", ("隐身", "隐生", "隐神", "鬼步", "鬼步走")),
-    "冰墙": Skill("冰墙", "ZZC", ("冰墙", "冰墙术", "兵强", "冰抢")),
-    "推波": Skill("推波", "ZXC", ("推波", "推播", "退播", "冲击波", "超声波")),
-    "火人": Skill("火人", "ZCC", ("火人", "活人", "伙人", "火灵", "熔炉精灵")),
+    "天火": Skill("天火", "CCC"),   # Sun Strike:      CCC + V + D
+    "陨石": Skill("陨石", "CCX"),   # Chaos Meteor:     CCX + V + D
+    "吹风": Skill("吹风", "ZXX"),   # Tornado:          ZXX + V + D
+    "磁暴": Skill("磁暴", "XXX"),   # EMP:              XXX + V + D
+    "隐身": Skill("隐身", "ZZX"),   # Ghost Walk:       ZZX + V + D
+    "冰墙": Skill("冰墙", "ZZC"),   # Ice Wall:         ZZC + V + D
+    "推波": Skill("推波", "ZXC"),   # Deafening Blast:  ZXC + V + D
 }
 
-# QWER -> ZXCV, invoke=V, cast=D
+# QWER → ZXCV keybind mapping
 KEYMAP = {
     "Z": "z",  # Quas
     "X": "x",  # Wex
@@ -98,194 +78,206 @@ KEYMAP = {
 }
 
 
-class SenseVoiceClient:
-    def __init__(self, url: str = STT_URL, timeout: int = STT_TIMEOUT):
-        self.url = url
-        self.timeout = timeout
-
-    def health(self) -> bool:
-        try:
-            r = requests.get("http://localhost:8771/health", timeout=3)
-            if r.ok:
-                print(f"[ASR] health: {r.json()}")
-                return True
-        except Exception as e:
-            print(f"[ASR] health check failed: {e}")
-        return False
-
-    def transcribe_wav(self, wav_bytes: bytes, lang: str = "zh") -> str:
-        files = {"audio": ("utterance.wav", wav_bytes, "audio/wav")}
-        params = {"lang": lang}
-        r = requests.post(self.url, files=files, params=params, timeout=self.timeout)
-        r.raise_for_status()
-        data = r.json()
-        return (data.get("text") or "").strip()
+def format_key_sequence(skill: Skill) -> str:
+    """Human-readable key sequence for a skill."""
+    elems = " ".join(KEYMAP[k] for k in skill.keys)
+    return f"{elems} {KEYMAP['V']} {KEYMAP['D']}"
 
 
+# ──────────────────── Debouncer ─────────────────────────────
+class Debouncer:
+    """Suppress repeated triggers of the same keyword within DEBOUNCE_MS."""
+
+    def __init__(self, window_ms: int = DEBOUNCE_MS):
+        self._window = window_ms / 1000.0
+        self._last: Dict[str, float] = {}
+
+    def should_trigger(self, keyword: str) -> bool:
+        now = time.monotonic()
+        if keyword not in self._last:
+            self._last[keyword] = now
+            return True
+
+        last = self._last[keyword]
+        if now - last < self._window:
+            return False
+        self._last[keyword] = now
+        return True
+
+
+# ──────────────────── Keyboard caster ───────────────────────
 class InvokerCaster:
-    def __init__(self):
-        self.kbd = KeyboardController()
+    def __init__(self, keyboard=None):
+        self.kbd = keyboard or KeyboardController()
 
     def _tap(self, key: str):
         self.kbd.press(key)
         self.kbd.release(key)
 
-    def cast_skill(self, skill: Skill):
-        print(f"[CAST] {skill.name} => {skill.keys} -> V -> D")
+    def cast_skill(self, skill: Skill) -> List[str]:
+        """Execute skill key sequence. Returns list of keys pressed."""
+        keys_pressed = []
 
+        # Element keys
         for i, k in enumerate(skill.keys):
-            self._tap(KEYMAP[k])
+            mapped = KEYMAP[k]
+            self._tap(mapped)
+            keys_pressed.append(mapped)
             if i < len(skill.keys) - 1:
                 time.sleep(random.uniform(ELEM_DELAY_MIN, ELEM_DELAY_MAX))
 
+        # Invoke
         time.sleep(INVOKE_DELAY)
         self._tap(KEYMAP["V"])
+        keys_pressed.append(KEYMAP["V"])
+
+        # Cast
         time.sleep(random.uniform(CAST_DELAY_MIN, CAST_DELAY_MAX))
         self._tap(KEYMAP["D"])
+        keys_pressed.append(KEYMAP["D"])
+
+        return keys_pressed
 
 
-class SkillMatcher:
-    def __init__(self):
-        self._candidates: List[Tuple[str, str]] = []
-        for canonical, skill in SKILLS.items():
-            self._candidates.append((canonical, canonical))
-            for a in skill.aliases:
-                self._candidates.append((a, canonical))
+# ──────────────────── KWS Engine (sherpa-onnx) ──────────────
+class KeywordSpotter:
+    """
+    Keyword spotter using sherpa-onnx streaming KWS.
 
-    @staticmethod
-    def _clean(text: str) -> str:
-        t = text.strip()
-        for ch in "，。！？,.!?:;；、 ":
-            t = t.replace(ch, "")
-        return t
+    Requires model files. Set env DOTA_KWS_MODEL_DIR or pass model_dir.
+    Download a Chinese KWS model from:
+      https://github.com/k2-fsa/sherpa-onnx/releases
+    Expected files in model_dir:
+      encoder-epoch-*.onnx, decoder-epoch-*.onnx, joiner-epoch-*.onnx, tokens.txt
+    """
 
-    def match(self, text: str) -> Tuple[Optional[Skill], float, str]:
-        cleaned = self._clean(text)
-        if not cleaned:
-            return None, 0.0, ""
+    def __init__(self, model_dir: Optional[str] = None):
+        try:
+            import sherpa_onnx  # noqa: F811
+            self._sherpa = sherpa_onnx
+        except ImportError:
+            raise RuntimeError(
+                "sherpa-onnx not installed. Install: pip install sherpa-onnx\n"
+                "Then download a Chinese KWS model — see README.md"
+            )
 
-        # exact contain first
-        for canonical, skill in SKILLS.items():
-            if canonical in cleaned:
-                return skill, 1.0, canonical
-            for a in skill.aliases:
-                if a in cleaned:
-                    return skill, 0.96, a
+        model_dir = model_dir or os.environ.get("DOTA_KWS_MODEL_DIR", "./kws_model")
+        if not os.path.isdir(model_dir):
+            raise FileNotFoundError(
+                f"KWS model directory not found: {model_dir}\n"
+                f"Set DOTA_KWS_MODEL_DIR or place models in ./kws_model"
+            )
 
-        # fuzzy
-        best_score = 0.0
-        best_skill = None
-        best_hit = ""
+        self._keywords = list(SKILLS.keys())
+        self._kws, self._stream = self._init_kws(model_dir)
+        print(f"[KWS] loaded model from {model_dir}, keywords: {self._keywords}")
 
-        for alias, canonical in self._candidates:
-            score = 0.0
-            if HAS_RAPIDFUZZ:
-                score = fuzz.ratio(cleaned, alias) / 100.0
-            else:
-                score = difflib.SequenceMatcher(None, cleaned, alias).ratio()
+    def _find_model_file(self, model_dir: str, pattern: str) -> str:
+        """Find first file matching pattern in model_dir."""
+        import glob
+        matches = glob.glob(os.path.join(model_dir, pattern))
+        if not matches:
+            raise FileNotFoundError(f"No file matching '{pattern}' in {model_dir}")
+        return matches[0]
 
-            # also compare in small windows for longer recognized text
-            if len(cleaned) > 3 and len(alias) <= len(cleaned):
-                for i in range(0, len(cleaned) - len(alias) + 1):
-                    seg = cleaned[i : i + len(alias)]
-                    if HAS_RAPIDFUZZ:
-                        s2 = fuzz.ratio(seg, alias) / 100.0
-                    else:
-                        s2 = difflib.SequenceMatcher(None, seg, alias).ratio()
-                    if s2 > score:
-                        score = s2
+    def _init_kws(self, model_dir: str):
+        # Write keywords file
+        kw_path = os.path.join(model_dir, "_keywords_generated.txt")
+        with open(kw_path, "w", encoding="utf-8") as f:
+            for kw in self._keywords:
+                # sherpa-onnx keyword format: keyword /threshold
+                f.write(f"{kw}\n")
 
-            if score > best_score:
-                best_score = score
-                best_skill = SKILLS[canonical]
-                best_hit = alias
+        # Find model files (naming varies by model release)
+        encoder = self._find_model_file(model_dir, "encoder*.onnx")
+        decoder = self._find_model_file(model_dir, "decoder*.onnx")
+        joiner = self._find_model_file(model_dir, "joiner*.onnx")
+        tokens = os.path.join(model_dir, "tokens.txt")
 
-        # conservative threshold to reduce false trigger
-        if best_score >= 0.78:
-            return best_skill, best_score, best_hit
-        return None, best_score, best_hit
+        if not os.path.isfile(tokens):
+            raise FileNotFoundError(f"tokens.txt not found in {model_dir}")
+
+        kws = self._sherpa.KeywordSpotter(
+            tokens=tokens,
+            encoder=encoder,
+            decoder=decoder,
+            joiner=joiner,
+            keywords_file=kw_path,
+            num_threads=2,
+            provider="cpu",
+        )
+        stream = kws.create_stream(keywords="\n".join(self._keywords))
+        return kws, stream
+
+    def accept_waveform(self, samples: np.ndarray):
+        """Feed audio samples (float32, 16kHz mono)."""
+        self._stream.accept_waveform(SAMPLE_RATE, samples.astype(np.float32))
+
+    def get_keyword(self) -> Optional[str]:
+        """Decode and check for keyword detection. Returns keyword or None."""
+        while self._kws.is_ready(self._stream):
+            self._kws.decode_stream(self._stream)
+
+        result = self._kws.get_result(self._stream)
+        keyword = result.strip() if isinstance(result, str) else ""
+        if not keyword:
+            return None
+        # Normalize: extract just the keyword name
+        for kw in self._keywords:
+            if kw in keyword:
+                return kw
+        return None
 
 
+# ──────────────────── Main application ──────────────────────
 class VoiceInvoker:
-    def __init__(self):
-        self.client = SenseVoiceClient()
-        self.matcher = SkillMatcher()
-        self.caster = InvokerCaster()
-
-        self.audio_q: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=256)
-        self.running = threading.Event()
-        self.running.set()
-
-        self.noise_floor = 0.006
-        self.in_speech = False
-        self.speech_frames: List[np.ndarray] = []
-        self.pre_roll: List[np.ndarray] = []
-        self.silence_blocks = 0
-        self.speech_started_at = 0.0
+    def __init__(self, kws: Optional[KeywordSpotter] = None, caster: Optional[InvokerCaster] = None):
+        self.kws = kws  # lazily init in run() if None
+        self.caster = caster or InvokerCaster()
+        self.debouncer = Debouncer(DEBOUNCE_MS)
+        self.audio_q: queue.Queue[np.ndarray] = queue.Queue(maxsize=512)
+        self.running = True
 
     def _audio_callback(self, indata, frames, time_info, status):
-        if status:
-            pass
         mono = np.copy(indata[:, 0])
         try:
             self.audio_q.put_nowait(mono)
         except queue.Full:
-            # drop block under pressure
-            pass
+            pass  # drop under pressure
 
-    @staticmethod
-    def _rms(x: np.ndarray) -> float:
-        return float(np.sqrt(np.mean(np.square(x)) + 1e-12))
+    def _on_keyword(self, keyword: str):
+        """Handle a detected keyword: debounce → log → cast."""
+        t_start = time.monotonic()
 
-    def _to_wav_bytes(self, frames: List[np.ndarray]) -> bytes:
-        pcm = np.concatenate(frames)
-        pcm = np.clip(pcm, -1.0, 1.0)
-        pcm16 = (pcm * 32767.0).astype(np.int16)
-
-        buf = io.BytesIO()
-        with wave.open(buf, "wb") as wf:
-            wf.setnchannels(CHANNELS)
-            wf.setsampwidth(2)
-            wf.setframerate(SAMPLE_RATE)
-            wf.writeframes(pcm16.tobytes())
-        return buf.getvalue()
-
-    def _handle_utterance(self, frames: List[np.ndarray]):
-        duration = len(np.concatenate(frames)) / SAMPLE_RATE
-        if duration < MIN_SPEECH_SEC:
+        if not self.debouncer.should_trigger(keyword):
+            print(f"[KWS] '{keyword}' debounced (within {DEBOUNCE_MS}ms)")
             return
 
-        wav_bytes = self._to_wav_bytes(frames)
-        try:
-            text = self.client.transcribe_wav(wav_bytes, lang="zh")
-        except Exception as e:
-            print(f"[ASR] request failed: {e}")
-            return
-
-        if not text:
-            print("[ASR] (empty)")
-            return
-
-        skill, score, hit = self.matcher.match(text)
+        skill = SKILLS.get(keyword)
         if skill is None:
-            print(f"[ASR] '{text}' -> no match (best={score:.2f}, hit='{hit}')")
+            print(f"[KWS] '{keyword}' has no skill mapping, ignored")
             return
 
-        print(f"[ASR] '{text}' -> {skill.name} (score={score:.2f}, via='{hit}')")
-        self.caster.cast_skill(skill)
+        seq = format_key_sequence(skill)
+        keys = self.caster.cast_skill(skill)
+        elapsed_ms = (time.monotonic() - t_start) * 1000
+
+        print(
+            f"[KWS] keyword='{keyword}' | skill={skill.name} | "
+            f"keys=[{', '.join(keys)}] | seq='{seq}' | "
+            f"cast_time={elapsed_ms:.1f}ms"
+        )
 
     def run(self):
         print("=" * 64)
-        print("Dota2 Invoker Voice Control")
-        print("监听中... 说技能名: 天火/陨石/吹风/磁暴/隐身/冰墙/推波/火人")
+        print("Dota2 Invoker Voice — Pure KWS Mode")
+        print(f"关键词: {', '.join(SKILLS.keys())}")
+        print(f"去抖动: {DEBOUNCE_MS}ms | 改键: QWER→ZXCV")
         print("按 Ctrl+C 退出")
         print("=" * 64)
 
-        if not self.client.health():
-            print("[WARN] SenseVoice health check failed. Will keep trying on requests.")
-
-        pre_roll_blocks = max(1, int(PRE_ROLL_SEC * 1000 / BLOCK_MS))
-        end_sil_blocks = max(1, int(END_SILENCE_SEC * 1000 / BLOCK_MS))
+        if self.kws is None:
+            self.kws = KeywordSpotter()
 
         with sd.InputStream(
             samplerate=SAMPLE_RATE,
@@ -294,60 +286,46 @@ class VoiceInvoker:
             blocksize=BLOCK_SIZE,
             callback=self._audio_callback,
         ):
-            while self.running.is_set():
+            while self.running:
                 try:
-                    block = self.audio_q.get(timeout=0.2)
+                    block = self.audio_q.get(timeout=0.1)
                 except queue.Empty:
                     continue
 
-                rms = self._rms(block)
+                self.kws.accept_waveform(block)
+                keyword = self.kws.get_keyword()
+                if keyword:
+                    self._on_keyword(keyword)
 
-                if not self.in_speech:
-                    self.noise_floor = NOISE_EMA_ALPHA * self.noise_floor + (1 - NOISE_EMA_ALPHA) * min(rms, 0.03)
-
-                start_th = max(0.008, self.noise_floor * START_MULTIPLIER)
-                end_th = max(0.006, self.noise_floor * END_MULTIPLIER)
-
-                # maintain pre-roll
-                self.pre_roll.append(block)
-                if len(self.pre_roll) > pre_roll_blocks:
-                    self.pre_roll.pop(0)
-
-                now = time.time()
-                if not self.in_speech:
-                    if rms >= start_th:
-                        self.in_speech = True
-                        self.speech_started_at = now
-                        self.silence_blocks = 0
-                        self.speech_frames = list(self.pre_roll)
-                        self.speech_frames.append(block)
-                    continue
-
-                # in speech
-                self.speech_frames.append(block)
-                if rms < end_th:
-                    self.silence_blocks += 1
-                else:
-                    self.silence_blocks = 0
-
-                speech_sec = len(np.concatenate(self.speech_frames)) / SAMPLE_RATE
-                timeout_hit = speech_sec >= MAX_UTTERANCE_SEC
-                end_hit = self.silence_blocks >= end_sil_blocks
-
-                if end_hit or timeout_hit:
-                    frames = self.speech_frames
-                    self.in_speech = False
-                    self.speech_frames = []
-                    self.silence_blocks = 0
-
-                    self._handle_utterance(frames)
+    def stop(self):
+        self.running = False
 
 
+# ──────────────────── Deprecated ASR code ───────────────────
+# [DEPRECATED] The following classes are from the old ASR-based architecture.
+# They are kept for reference only and are NOT used in the KWS pipeline.
+# Do not instantiate or call these classes.
+
+class _DeprecatedSenseVoiceClient:  # pragma: no cover
+    """DEPRECATED: ASR client removed from active pipeline. Use KeywordSpotter instead."""
+
+    def __init__(self, url: str = "http://localhost:8771/transcribe", timeout: int = 15):
+        raise NotImplementedError("ASR pipeline is deprecated. Use KWS (KeywordSpotter) instead.")
+
+
+class _DeprecatedSkillMatcher:  # pragma: no cover
+    """DEPRECATED: Fuzzy matcher removed from active pipeline. KWS provides direct keyword detection."""
+
+    def __init__(self):
+        raise NotImplementedError("Fuzzy matcher is deprecated. KWS provides direct keyword detection.")
+
+
+# ──────────────────── Entry point ───────────────────────────
 def main():
     app = VoiceInvoker()
 
     def _stop(*_):
-        app.running.clear()
+        app.stop()
 
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)

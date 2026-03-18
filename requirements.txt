@@ -1,5 +1,4 @@
-requests
 numpy
 sounddevice
 pynput
-rapidfuzz
+sherpa-onnx
