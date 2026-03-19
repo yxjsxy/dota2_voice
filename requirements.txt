@@ -3,3 +3,4 @@ sounddevice
 pynput
 sherpa-onnx
 PyYAML
+pypinyin

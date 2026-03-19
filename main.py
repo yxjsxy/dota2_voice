@@ -34,11 +34,19 @@ except Exception as e:  # pragma: no cover
     print(f"[FATAL] pynput not available: {e}")
     sys.exit(1)
 
+try:
+    from pypinyin import Style, lazy_pinyin
+except Exception:  # pragma: no cover
+    Style = None
+    lazy_pinyin = None
+
 
 # ──────────────────── Config ────────────────────────────────
 SAMPLE_RATE = 16000
 CHANNELS = 1
 BLOCK_SIZE = 512  # ~32ms per block at 16kHz
+INPUT_DEVICE = os.environ.get("DOTA_INPUT_DEVICE", "").strip() or None
+KWS_DEBUG_RAW_RESULT = os.environ.get("DOTA_KWS_DEBUG_RAW", "").strip() in {"1", "true", "True"}
 
 # Debounce: same keyword suppressed within this window
 DEBOUNCE_MS = 350
@@ -220,6 +228,7 @@ class KeywordSpotter:
             )
 
         self._keywords = list(SKILLS.keys())
+        self._token_to_keyword: Dict[str, str] = {}
         self._kws, self._stream = self._init_kws(model_dir)
         print(f"[KWS] loaded model from {model_dir}, keywords: {self._keywords}")
 
@@ -232,21 +241,72 @@ class KeywordSpotter:
         return matches[0]
 
     def _init_kws(self, model_dir: str):
+        tokens = os.path.join(model_dir, "tokens.txt")
+        if not os.path.isfile(tokens):
+            raise FileNotFoundError(f"tokens.txt not found in {model_dir}")
+
+        vocab = set()
+        with open(tokens, "r", encoding="utf-8") as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                tok = s.split()[0]
+                vocab.add(tok)
+
+        def _keyword_to_token_line(keyword: str) -> str:
+            # sherpa-onnx zh-en model expects pinyin tokens (initial + finals with tones).
+            # Example: 天火 -> t iān h uǒ
+            if lazy_pinyin is not None and Style is not None:
+                initials = lazy_pinyin(keyword, style=Style.INITIALS, strict=False)
+                finals = lazy_pinyin(
+                    keyword,
+                    style=Style.FINALS_TONE,
+                    strict=False,
+                    v_to_u=True,
+                    neutral_tone_with_five=False,
+                )
+                parts: List[str] = []
+                for ini, fin in zip(initials, finals):
+                    if ini:
+                        parts.append(ini)
+                    if fin:
+                        parts.append(fin)
+                if parts:
+                    return " ".join(parts)
+
+            # Fallback for environments without pypinyin.
+            return " ".join(list(keyword.strip()))
+
         # Write keywords file
         kw_path = os.path.join(model_dir, "_keywords_generated.txt")
         with open(kw_path, "w", encoding="utf-8") as f:
+            missing_tokens: Dict[str, List[str]] = {}
             for kw in self._keywords:
-                # sherpa-onnx keyword format: keyword /threshold
-                f.write(f"{kw}\n")
+                token_line = _keyword_to_token_line(kw)
+                token_line_norm = " ".join(token_line.split())
+                parts = token_line.split()
+                missing = [p for p in parts if p not in vocab]
+                if missing:
+                    missing_tokens[kw] = missing
+                # Use "@中文关键词" alias so get_result() can return readable labels.
+                f.write(f"{token_line_norm} @{kw}\n")
+                self._token_to_keyword[token_line_norm] = kw
+
+        if missing_tokens:
+            missing_msg = "; ".join(
+                f"{kw}: {', '.join(tokens)}" for kw, tokens in missing_tokens.items()
+            )
+            raise RuntimeError(
+                "KWS keywords contain tokens not found in tokens.txt. "
+                f"Details -> {missing_msg}. "
+                "Check skills.yaml keywords or use a matching model."
+            )
 
         # Find model files (naming varies by model release)
         encoder = self._find_model_file(model_dir, "encoder*.onnx")
         decoder = self._find_model_file(model_dir, "decoder*.onnx")
         joiner = self._find_model_file(model_dir, "joiner*.onnx")
-        tokens = os.path.join(model_dir, "tokens.txt")
-
-        if not os.path.isfile(tokens):
-            raise FileNotFoundError(f"tokens.txt not found in {model_dir}")
 
         kws = self._sherpa.KeywordSpotter(
             tokens=tokens,
@@ -257,7 +317,7 @@ class KeywordSpotter:
             num_threads=2,
             provider="cpu",
         )
-        stream = kws.create_stream(keywords="\n".join(self._keywords))
+        stream = kws.create_stream()
         return kws, stream
 
     def accept_waveform(self, samples: np.ndarray):
@@ -273,10 +333,20 @@ class KeywordSpotter:
         keyword = result.strip() if isinstance(result, str) else ""
         if not keyword:
             return None
-        # Normalize: extract just the keyword name
+        # 1) Direct alias match (if keywords_file uses "@中文关键词").
         for kw in self._keywords:
             if kw in keyword:
                 return kw
+
+        # 2) Map tokenized result back to configured keyword.
+        keyword_norm = " ".join(keyword.split())
+        mapped = self._token_to_keyword.get(keyword_norm)
+        if mapped:
+            return mapped
+
+        # 3) Optional debug for unexpected recognition outputs.
+        if KWS_DEBUG_RAW_RESULT:
+            print(f"[KWS][DEBUG] raw_result='{keyword}'")
         return None
 
 
@@ -288,8 +358,13 @@ class VoiceInvoker:
         self.debouncer = Debouncer(DEBOUNCE_MS)
         self.audio_q: queue.Queue[np.ndarray] = queue.Queue(maxsize=512)
         self.running = True
+        self._stream_status_warned = False
 
     def _audio_callback(self, indata, frames, time_info, status):
+        if status and not self._stream_status_warned:
+            # Print once to avoid flooding the terminal.
+            print(f"[AUDIO] stream status warning: {status}")
+            self._stream_status_warned = True
         mono = np.copy(indata[:, 0])
         try:
             self.audio_q.put_nowait(mono)
@@ -324,19 +399,28 @@ class VoiceInvoker:
         print("Dota2 Invoker Voice — Pure KWS Mode")
         print(f"关键词: {', '.join(SKILLS.keys())}")
         print(f"去抖动: {DEBOUNCE_MS}ms | 改键: QWER→ZXCV | cast_mode={self.caster.cast_mode}")
+        print(f"输入设备: {INPUT_DEVICE if INPUT_DEVICE is not None else '系统默认'}")
         print("按 Ctrl+C 退出")
         print("=" * 64)
 
         if self.kws is None:
             self.kws = KeywordSpotter()
 
-        with sd.InputStream(
+        stream_kwargs = dict(
             samplerate=SAMPLE_RATE,
             channels=CHANNELS,
             dtype="float32",
             blocksize=BLOCK_SIZE,
             callback=self._audio_callback,
-        ):
+        )
+        if INPUT_DEVICE is not None:
+            # Accept either numeric index or partial device name supported by PortAudio.
+            try:
+                stream_kwargs["device"] = int(INPUT_DEVICE)
+            except ValueError:
+                stream_kwargs["device"] = INPUT_DEVICE
+
+        with sd.InputStream(**stream_kwargs):
             while self.running:
                 try:
                     block = self.audio_q.get(timeout=0.1)

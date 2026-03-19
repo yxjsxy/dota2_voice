@@ -22,9 +22,9 @@ python3 -m pip install -r requirements.txt
 
 Windows:
 ```powershell
-py -3.10 -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 ---
@@ -66,6 +66,32 @@ powershell -ExecutionPolicy Bypass -File .\scripts\download_kws_model.ps1 -Model
 ```bash
 cd ~/Documents/vibe_coding/dota2_voice
 python3 main.py
+```
+
+Windows:
+```powershell
+cd "C:\path\to\dota2_voice"
+.\.venv\Scripts\python.exe .\main.py
+```
+
+### Windows 环境变量（可选）
+
+- 指定输入麦克风（设备索引或设备名）：
+  ```powershell
+  $env:DOTA_INPUT_DEVICE="1"
+  ```
+- 打印 sherpa-onnx 原始识别结果（排查无触发问题）：
+  ```powershell
+  $env:DOTA_KWS_DEBUG_RAW="1"
+  ```
+- 使用自定义模型目录：
+  ```powershell
+  $env:DOTA_KWS_MODEL_DIR="D:\models\kws_model"
+  ```
+
+可先用下面命令查看可用输入设备：
+```powershell
+python -c "import sounddevice as sd; [print(i, d['name']) for i,d in enumerate(sd.query_devices()) if d['max_input_channels']>0]"
 ```
 
 ---
