@@ -16,8 +16,11 @@
 ## 1) 安装依赖
 
 ```bash
-cd ~/Documents/vibe_coding/dota2_voice
-python3 -m pip install -r requirements.txt
+git clone https://github.com/yxjsxy/dota2_voice.git
+cd dota2_voice
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
 Windows:
@@ -64,7 +67,6 @@ powershell -ExecutionPolicy Bypass -File .\scripts\download_kws_model.ps1 -Model
 ## 3) 运行
 
 ```bash
-cd ~/Documents/vibe_coding/dota2_voice
 python3 main.py
 ```
 
